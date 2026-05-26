@@ -1,0 +1,574 @@
+/// <summary>
+/// Hikari の自動回復、光負荷、Guard Resonance、Overflow Counter を管理するプロトタイプコンポーネント。
+/// </summary>
+/// <remarks>
+/// 公開用ポートフォリオ向けにコメントのみ日本語化・整理しています。
+/// C# の処理、フィールド名、メソッド名、文字列リテラル、Inspector 表示文字列は変更していません。
+/// </remarks>
+using UnityEngine;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+public class HikariSupportController : MonoBehaviour
+{
+    
+
+    [Header("プレイヤー参照")]
+    [Tooltip("手動でアサインしない場合、Start() で PlayerTag から自動検索します。")]
+    [SerializeField] private HealthComponent playerHealth;
+    [SerializeField] private string playerTag = "Player";
+
+    [Header("微光治愈 / Light Mend")]
+    [Tooltip("false にすると Light Mend を完全に無効化します。")]
+    [SerializeField] private bool enableLightMend = true;
+
+    [Tooltip("この比率を下回ったときに治療を発動します（0〜1）。デフォルト 0.8 = HP 80% 未満で発動。")]
+    [SerializeField, Range(0f, 1f)] private float lightMendHpThreshold = 0.8f;
+
+    [Tooltip("1 回あたりの回復量（実際の回復量は上限クリップされます）。")]
+    [SerializeField] private float lightMendHealAmount = 15f;
+
+    [Tooltip("Light Mend の最短発動間隔（秒）。")]
+    [SerializeField] private float lightMendCooldown = 5f;
+
+    [Header("紧急祈愿 / Emergency Prayer")]
+    [Tooltip("false にすると Emergency Prayer を完全に無効化します。")]
+    [SerializeField] private bool enableEmergencyPrayer = true;
+
+    [Tooltip("この比率を下回ったときに EP を発動します（0〜1）。デフォルト 0.35 = HP 35% 未満で発動。")]
+    [SerializeField, Range(0f, 1f)] private float emergencyPrayerHpThreshold = 0.35f;
+
+    [Tooltip("1 回あたりの回復量（実際の回復量は上限クリップされます）。")]
+    [SerializeField] private float emergencyPrayerHealAmount = 45f;
+
+    [Tooltip("Emergency Prayer の最短発動間隔（秒）。")]
+    [SerializeField] private float emergencyPrayerCooldown = 25f;
+
+    [Header("Burden / 光負荷")]
+    [Tooltip("Hikari の光負荷最大値。")]
+    [SerializeField] private float maxBurden = 100f;
+
+    [Tooltip("現在の光負荷。Inspector で確認可能。")]
+    [SerializeField] private float currentBurden = 0f;
+
+    [Tooltip("Light Mend 発動一回あたりの光負荷追加量。")]
+    [SerializeField] private float lightMendBurdenGain = 5f;
+
+    [Tooltip("Emergency Prayer 発動一回あたりの光負荷追加量。")]
+    [SerializeField] private float emergencyPrayerBurdenGain = 25f;
+
+    [Tooltip("光負荷の自然回復度（/秒）。")]
+    [SerializeField] private float burdenRecoveryPerSecond = 1f;
+
+    [Tooltip("false にすると光負荷の自然回復を停止します。")]
+    [SerializeField] private bool enableBurdenRecovery = true;
+
+    
+[Header("光溢出状态 / Light Overflow (80%~99%)")]
+    [Tooltip("光负荷比例达到此阈值后进入光溢出状态（0~1）。默认 0.8 = 80% 以上进入光溢出。")]
+    [SerializeField, Range(0f, 1f)] private float overburdenThreshold = 0.8f;
+
+    [Tooltip("光溢出状态下，可控治疗效率下降倍率。默认 0.5 = 可控治疗效率降至 50%。")]
+    [SerializeField, Range(0f, 1f)] private float overburdenHealingMultiplier = 0.5f;
+
+    [Header("Guard Resonance / 守护共鸣")]
+    [Tooltip("玩家在 DamageReduction 技能 Active 期间受伤时，降低 Hikari 光负荷。")]
+    [SerializeField] private bool  guardResonanceEnabled        = true;
+    [Tooltip("守护共鸣触发时减少的光负荷量。")]
+    [SerializeField] private float guardResonanceBurdenReduction = 10f;
+    [Tooltip("守护共鸣的最短触发间隔（秒）。")]
+    [SerializeField] private float guardResonanceCooldown        = 3f;
+    [Tooltip("読条重撃記録と受傷時刻の許容差（秒）。これ以内ならスキル命中とみなす。")]
+    [SerializeField] private float guardResonanceSkillHitWindow  = 0.25f;
+
+    [Header("溢光反震 / Overflow Counter")]
+    [Tooltip("是否启用溢光反震 / Overflow Counter。")]
+    [SerializeField] private bool lightCounterEnabled = true;
+    [Tooltip("溢光反震触发的最低光负荷比例。默认 0.8 = 80%。光溢出区间（80%~99%）内触发。")]
+    [SerializeField, Range(0f, 1f)] private float lightCounterMinBurdenRatio = 0.8f;
+    [Tooltip("Light Counter \u767a\u52d5\u306e\u4e0a\u9650 Burden \u6bd4\u7387\uff08\u672a\u6e80\uff09\u3002\u30c7\u30d5\u30a9\u30eb\u30c8 1.0 = 100%\u672a\u6e80\uff08\u904e\u8f09\u6642\u306f\u767a\u52d5\u3057\u306a\u3044\uff09\u3002")]
+    [SerializeField, Range(0f, 1f)] private float lightCounterMaxBurdenRatio = 1.0f;
+    [Tooltip("溢光反震对攻击者造成的固定伤害值。")]
+    [SerializeField] private float lightCounterDamage = 30f;
+
+
+    
+[Header("导光封锁 / Channel Lockdown (100%)")]
+    [Tooltip("光负荷达到此比例时进入导光封锁（0~1）。默认 1.0 = 100% 时进入导光封锁，可控治疗停止。")]
+    [SerializeField, Range(0f, 1f)] private float overloadThreshold = 1f;
+
+    [Tooltip("导光恢复阈值：光负荷下降到此比例以下时，从导光封锁中恢复治疗能力。默认 0.6 = 60% 以下导光恢复。")]
+    [SerializeField, Range(0f, 1f)] private float overloadRecoveryThreshold = 0.6f;
+
+
+    
+
+[Header("デバッグ")]
+    [SerializeField] private bool logDebugMessages = true;
+
+    
+
+    private float _nextLightMendTime;
+
+    
+
+    public float CurrentBurden => currentBurden;
+    public float MaxBurden     => maxBurden;
+    public float BurdenRatio   => maxBurden > 0f ? currentBurden / maxBurden : 0f;
+    public bool  IsBurdenMaxed => currentBurden >= maxBurden;
+    public bool  IsOverloaded              => _isOverloaded;
+    public float OverloadThreshold         => overloadThreshold;
+    public float OverloadRecoveryThreshold => overloadRecoveryThreshold;
+    public bool  CanUseHealing             => !_isOverloaded;
+    public bool  GuardResonanceEnabled          => guardResonanceEnabled;
+    public float GuardResonanceBurdenReduction  => guardResonanceBurdenReduction;
+    public float GuardResonanceCooldown         => guardResonanceCooldown;
+    public float GuardResonanceCooldownRemaining => Mathf.Max(0f, _nextGuardResonanceTime - Time.time);
+
+    
+    
+    
+    
+    
+    public event System.Action<Transform, bool> OnGuardResonanceTriggered;
+
+    
+public bool  IsBurdenRecoveryEnabled  => enableBurdenRecovery;
+    public float BurdenRecoveryPerSecond  => burdenRecoveryPerSecond;
+
+    public bool  IsOverburdened             => BurdenRatio >= overburdenThreshold;
+    public float OverburdenThreshold        => overburdenThreshold;
+    public float OverburdenHealingMultiplier => overburdenHealingMultiplier;
+
+
+    private float _nextEmergencyPrayerTime;
+    private bool _isOverloaded;
+    private float               _nextGuardResonanceTime;
+    private PlayerSkillManager  _playerSkillManager;
+    private bool                _subscribedToPlayerDamaged;
+
+
+
+
+    
+
+private void Start()
+    {
+        if (playerHealth == null)
+        {
+            var playerGO = GameObject.FindGameObjectWithTag(playerTag);
+            if (playerGO == null)
+            {
+                Debug.LogWarning($"[HikariSupport] Tag '{playerTag}' のオブジェクトが見つかりません。" +
+                                 " playerHealth を Inspector でアサインするか、Player タグを確認してください。");
+                return;
+            }
+            playerHealth = playerGO.GetComponent<HealthComponent>();
+            if (playerHealth == null)
+            {
+                Debug.LogWarning($"[HikariSupport] '{playerGO.name}' に HealthComponent が見つかりません。");
+                return;
+            }
+            if (logDebugMessages)
+                Debug.Log($"[HikariSupport] playerHealth を自動解決しました: {playerGO.name}");
+
+            _playerSkillManager = playerGO.GetComponent<PlayerSkillManager>();
+            if (_playerSkillManager == null)
+                Debug.LogWarning("[HikariSupport] PlayerSkillManager が Player に見つかりません。Guard Resonance は機能しません。");
+        }
+        else
+        {
+            
+            _playerSkillManager = playerHealth.GetComponent<PlayerSkillManager>();
+        }
+
+        SubscribeToPlayerDamaged();
+    }
+
+private void OnDestroy()
+    {
+        UnsubscribeFromPlayerDamaged();
+    }
+
+    private void SubscribeToPlayerDamaged()
+    {
+        if (_subscribedToPlayerDamaged || playerHealth == null) return;
+        playerHealth.OnDamaged    += HandlePlayerDamaged;
+        _subscribedToPlayerDamaged = true;
+    }
+
+    private void UnsubscribeFromPlayerDamaged()
+    {
+        if (!_subscribedToPlayerDamaged || playerHealth == null) return;
+        playerHealth.OnDamaged    -= HandlePlayerDamaged;
+        _subscribedToPlayerDamaged = false;
+    }
+
+
+private void Update()
+    {
+        if (playerHealth == null) return;
+        if (playerHealth.IsDead)  return;
+
+        RecoverBurdenOverTime();
+        UpdateOverloadState();
+
+        if (!CanUseHealing) return;
+
+        float hpRatio = GetPlayerHpRatio();
+
+        if (hpRatio < emergencyPrayerHpThreshold)
+        {
+            if (TryUseEmergencyPrayer()) return;
+        }
+
+        if (hpRatio < lightMendHpThreshold)
+        {
+            TryUseLightMend();
+        }
+    }
+
+    
+
+    
+    
+    
+    
+private bool TryUseLightMend()
+    {
+        if (!enableLightMend) return false;
+        if (_isOverloaded)
+        {
+            if (logDebugMessages) Debug.Log("[HikariSupport] 微光治愈 跳过：导光封锁中（光负荷 100%）");
+            return false;
+        }
+        if (Time.time < _nextLightMendTime) return false;
+
+        float finalHeal = ApplyBurdenHealingModifier(lightMendHealAmount);
+
+        if (logDebugMessages)
+            Debug.Log($"[HikariSupport] Light Mend 発動 — HP {playerHealth.currentHealth:F1}/{playerHealth.maxHealth:F1}" +
+                      $" ({GetPlayerHpRatio() * 100f:F1}%) | base={lightMendHealAmount} final={finalHeal:F1}" +
+                      $" | Overburdened={IsOverburdened} | Burden {currentBurden:F1}/{maxBurden:F1}");
+
+        playerHealth.Heal(finalHeal, transform);
+        _nextLightMendTime = Time.time + lightMendCooldown;
+        AddBurden(lightMendBurdenGain, "Light Mend");
+        return true;
+    }
+
+
+
+    
+    
+    
+private bool TryUseEmergencyPrayer()
+    {
+        if (!enableEmergencyPrayer) return false;
+        if (_isOverloaded)
+        {
+            if (logDebugMessages) Debug.Log("[HikariSupport] 紧急祈愿 跳过：导光封锁中（光负荷 100%）");
+            return false;
+        }
+        if (Time.time < _nextEmergencyPrayerTime) return false;
+
+        float finalHeal = ApplyBurdenHealingModifier(emergencyPrayerHealAmount);
+
+        if (logDebugMessages)
+            Debug.Log($"[HikariSupport] Emergency Prayer 発動 — HP {playerHealth.currentHealth:F1}/{playerHealth.maxHealth:F1}" +
+                      $" ({GetPlayerHpRatio() * 100f:F1}%) | base={emergencyPrayerHealAmount} final={finalHeal:F1}" +
+                      $" | Overburdened={IsOverburdened} | Burden {currentBurden:F1}/{maxBurden:F1}");
+
+        playerHealth.Heal(finalHeal, transform);
+        _nextEmergencyPrayerTime = Time.time + emergencyPrayerCooldown;
+        AddBurden(emergencyPrayerBurdenGain, "Emergency Prayer");
+        return true;
+    }
+
+    
+
+    
+    
+    
+    private float GetPlayerHpRatio()
+    {
+        return playerHealth.maxHealth > 0f
+            ? playerHealth.currentHealth / playerHealth.maxHealth
+            : 1f;
+    }
+
+
+    
+    
+    private float ApplyBurdenHealingModifier(float baseHealAmount)
+    {
+        if (!IsOverburdened) return baseHealAmount;
+        return Mathf.Max(0f, baseHealAmount * overburdenHealingMultiplier);
+    }
+
+
+
+
+    
+    
+    
+private void AddBurden(float amount, string source)
+    {
+        if (amount <= 0f) return;
+        float before  = currentBurden;
+        currentBurden = Mathf.Clamp(currentBurden + amount, 0f, maxBurden);
+        if (logDebugMessages)
+            Debug.Log($"[HikariSupport] Burden [{source}] {before:F1} → {currentBurden:F1} / {maxBurden:F1}");
+        UpdateOverloadState();
+    }
+
+
+
+    
+    public void DebugAddBurden(float amount)
+    {
+        AddBurden(amount, "Debug");
+    }
+
+    
+public void DebugResetBurden()
+    {
+        currentBurden = 0f;
+        if (logDebugMessages)
+            Debug.Log("[HikariSupport] Burden reset by Debug.");
+        UpdateOverloadState();
+    }
+
+
+    public void DebugSetBurdenRecoveryEnabled(bool enabled)
+    {
+        enableBurdenRecovery = enabled;
+        if (logDebugMessages)
+            Debug.Log($"[HikariSupport] Burden recovery set to: {enableBurdenRecovery}");
+    }
+
+    
+    public void DebugToggleBurdenRecovery()
+    {
+        DebugSetBurdenRecoveryEnabled(!enableBurdenRecovery);
+    }
+
+
+
+    
+    
+    
+    private void RecoverBurdenOverTime()
+    {
+        if (!enableBurdenRecovery) return;
+        if (burdenRecoveryPerSecond <= 0f) return;
+        if (currentBurden <= 0f) return;
+        currentBurden = Mathf.Max(0f, currentBurden - burdenRecoveryPerSecond * Time.deltaTime);
+    }
+
+
+    
+    
+    private void UpdateOverloadState()
+    {
+        if (!_isOverloaded && BurdenRatio >= overloadThreshold)
+        {
+            _isOverloaded = true;
+            if (logDebugMessages)
+                Debug.Log("[HikariSupport] 进入导光封锁 — 可控治疗停止（Light Mend / Emergency Prayer 不触发）。");
+        }
+        else if (_isOverloaded && BurdenRatio <= overloadRecoveryThreshold)
+        {
+            _isOverloaded = false;
+            if (logDebugMessages)
+                Debug.Log("[HikariSupport] 导光恢复 — 光负荷降至 60% 以下，可控治疗恢复。");
+        }
+    }
+
+
+
+private void HandlePlayerDamaged(float damage, Transform attacker)
+    {
+        TryTriggerGuardResonance(attacker);
+    }
+
+private bool TryTriggerGuardResonance(Transform attacker)
+    {
+        if (!guardResonanceEnabled)               return false;
+        if (playerHealth == null)                  return false;
+        if (playerHealth.IsDead)                   return false;
+        if (Time.time < _nextGuardResonanceTime)   return false;
+        if (!HasActiveDamageReductionSkill())      return false;
+        if (!IsGuardResonanceTriggerHit(attacker)) return false;
+
+        
+        bool shouldLightCounter = ShouldTriggerLightCounter();
+
+        ReduceBurden(guardResonanceBurdenReduction, "Guard Resonance");
+        _nextGuardResonanceTime = Time.time + guardResonanceCooldown;
+
+        if (logDebugMessages)
+            Debug.Log("[HikariSupport] 守护共鸣 / Guard Resonance 触发 — 光负荷减少。");
+
+        bool grantsGuardCounter = HasCounterGrantingDamageReductionSkill();
+        OnGuardResonanceTriggered?.Invoke(attacker, grantsGuardCounter);
+
+        if (shouldLightCounter)
+            TryTriggerLightCounter(attacker);
+
+        return true;
+    }
+
+
+    
+    
+    private bool ShouldTriggerLightCounter()
+    {
+        if (!lightCounterEnabled) return false;
+        if (maxBurden <= 0f) return false;
+        float burdenRatio = currentBurden / maxBurden;
+        if (burdenRatio < lightCounterMinBurdenRatio) return false;
+        if (burdenRatio >= lightCounterMaxBurdenRatio) return false;
+        return true;
+    }
+
+    
+    
+    
+    private void TryTriggerLightCounter(Transform attacker)
+    {
+        if (attacker == null) return;
+        HealthComponent enemyHealth = attacker.GetComponent<HealthComponent>();
+        if (enemyHealth == null)
+            enemyHealth = attacker.GetComponentInParent<HealthComponent>();
+        if (enemyHealth == null) return;
+        if (enemyHealth.IsDead) return;
+
+        float burdenRatioBeforeReduction = currentBurden / maxBurden;
+        enemyHealth.TakeDamage(lightCounterDamage, transform);
+        Debug.Log($"[Hikari] 溢光反震 / Overflow Counter 触发！对 {enemyHealth.name} 造成 {lightCounterDamage} 点失控光伤害 | 光负荷（触发前）：{burdenRatioBeforeReduction * 100f:F1}%");
+    }
+
+
+    
+    
+    
+    
+    
+    private bool IsGuardResonanceTriggerHit(Transform attacker)
+    {
+        if (attacker == null) return false;
+
+        var skillCtrl = attacker.GetComponentInParent<EnemySkillController>();
+        if (skillCtrl == null) return false;
+
+        var lastSkill = skillCtrl.LastDamageSkillData;
+        if (lastSkill == null) return false;
+
+        
+        if (Time.time - skillCtrl.LastDamageSkillTime > guardResonanceSkillHitWindow) return false;
+
+        
+        return lastSkill.SkillType == EnemySkillType.CastAttack;
+    }
+
+    
+    
+    
+    private void ReduceBurden(float amount, string source)
+    {
+        if (amount <= 0f) return;
+        float oldBurden = currentBurden;
+        currentBurden   = Mathf.Max(0f, currentBurden - amount);
+        UpdateOverloadState();
+        if (logDebugMessages)
+            Debug.Log($"[HikariSupport] Burden reduced [{source}] {oldBurden:F1} → {currentBurden:F1} / {maxBurden:F1}");
+    }
+
+    
+    
+    
+    private bool HasActiveDamageReductionSkill()
+    {
+        if (_playerSkillManager == null) return false;
+        foreach (var state in _playerSkillManager.RuntimeStates)
+        {
+            if (state == null)             continue;
+            if (!state.IsActive)           continue;
+            if (state.SkillData == null)   continue;
+            if (state.SkillData.EffectType == PlayerSkillEffectType.DamageReduction)
+                return true;
+        }
+        return false;
+    }
+
+    
+    
+    
+    
+    private bool HasCounterGrantingDamageReductionSkill()
+    {
+        if (_playerSkillManager == null) return false;
+        foreach (var state in _playerSkillManager.RuntimeStates)
+        {
+            if (state == null)           continue;
+            if (!state.IsActive)         continue;
+            if (state.SkillData == null) continue;
+            if (state.SkillData.EffectType == PlayerSkillEffectType.DamageReduction
+                && state.SkillData.GrantsGuardCounter)
+                return true;
+        }
+        return false;
+    }
+
+
+
+private void OnValidate()
+    {
+        maxBurden                    = Mathf.Max(1f,  maxBurden);
+        currentBurden                = Mathf.Clamp(currentBurden, 0f, maxBurden);
+        lightMendBurdenGain          = Mathf.Max(0f,  lightMendBurdenGain);
+        emergencyPrayerBurdenGain    = Mathf.Max(0f,  emergencyPrayerBurdenGain);
+        burdenRecoveryPerSecond      = Mathf.Max(0f,  burdenRecoveryPerSecond);
+        lightMendHealAmount          = Mathf.Max(0f,  lightMendHealAmount);
+        emergencyPrayerHealAmount    = Mathf.Max(0f,  emergencyPrayerHealAmount);
+        lightMendCooldown            = Mathf.Max(0f,  lightMendCooldown);
+        emergencyPrayerCooldown      = Mathf.Max(0f,  emergencyPrayerCooldown);
+        overburdenThreshold          = Mathf.Clamp01(overburdenThreshold);
+        overburdenHealingMultiplier  = Mathf.Clamp01(overburdenHealingMultiplier);
+        overloadThreshold            = Mathf.Clamp01(overloadThreshold);
+        overloadRecoveryThreshold    = Mathf.Clamp(overloadRecoveryThreshold, 0f, overloadThreshold);
+        guardResonanceBurdenReduction = Mathf.Max(0f, guardResonanceBurdenReduction);
+        guardResonanceCooldown        = Mathf.Max(0f, guardResonanceCooldown);
+        guardResonanceSkillHitWindow  = Mathf.Max(0f, guardResonanceSkillHitWindow);
+        lightCounterDamage           = Mathf.Max(0f, lightCounterDamage);
+        lightCounterMinBurdenRatio   = Mathf.Clamp01(lightCounterMinBurdenRatio);
+        lightCounterMaxBurdenRatio   = Mathf.Clamp01(lightCounterMaxBurdenRatio);
+
+    }
+
+
+}
